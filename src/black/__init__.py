@@ -77,7 +77,16 @@ from black.nodes import (
     is_string_token,
     syms,
 )
-from black.output import color_diff, diff, dump_to_file, err, ipynb_diff, out
+from black.output import (
+    color_diff,
+    diff,
+    dump_to_file,
+    err,
+    ipynb_diff,
+    merge_patches,
+    out,
+    gen_patch_diff,
+)
 from black.parsing import InvalidInput  # noqa F401
 from black.parsing import lib2to3_parse, parse_ast, stringify_ast
 from black.report import Changed, NothingChanged, Report
@@ -99,13 +108,21 @@ class WriteBack(Enum):
     DIFF = 2
     CHECK = 3
     COLOR_DIFF = 4
+    PATCH = 5
+    COLOR_PATCH = 6
 
     @classmethod
     def from_configuration(
-        cls, *, check: bool, diff: bool, color: bool = False
+        cls, *, check: bool, diff: bool, patch: bool, color: bool = False
     ) -> "WriteBack":
-        if check and not diff:
+        if check and not diff and not patch:
             return cls.CHECK
+
+        if patch and color:
+            return cls.COLOR_PATCH
+
+        if patch:
+            return cls.PATCH
 
         if diff and color:
             return cls.COLOR_DIFF
@@ -265,6 +282,12 @@ def validate_regex(
     "--skip-magic-trailing-comma",
     is_flag=True,
     help="Don't use trailing commas as a reason to split lines.",
+)
+@click.option(
+    "-p",
+    "--patch",
+    is_flag=True,
+    help="Interactively choose hunks of formatted patches to write.",
 )
 @click.option(
     "--experimental-string-processing",
@@ -437,6 +460,7 @@ def main(  # noqa: C901
     skip_source_first_line: bool,
     skip_string_normalization: bool,
     skip_magic_trailing_comma: bool,
+    patch: bool,
     experimental_string_processing: bool,
     preview: bool,
     quiet: bool,
@@ -526,7 +550,9 @@ def main(  # noqa: C901
         err("Cannot pass both `pyi` and `ipynb` flags!")
         ctx.exit(1)
 
-    write_back = WriteBack.from_configuration(check=check, diff=diff, color=color)
+    write_back = WriteBack.from_configuration(
+        check=check, diff=diff, patch=patch, color=color
+    )
     if target_version:
         versions = set(target_version)
     else:
@@ -581,14 +607,15 @@ def main(  # noqa: C901
             ctx,
         )
 
-        if len(sources) == 1:
-            reformat_one(
-                src=sources.pop(),
-                fast=fast,
-                write_back=write_back,
-                mode=mode,
-                report=report,
-            )
+        if patch or len(sources) == 1:
+            for src in sources:
+                reformat_one(
+                    src=src,
+                    fast=fast,
+                    write_back=write_back,
+                    mode=mode,
+                    report=report,
+                )
         else:
             from black.concurrency import reformat_many
 
@@ -819,6 +846,58 @@ def format_file_in_place(
     if write_back == WriteBack.YES:
         with open(src, "w", encoding=encoding, newline=newline) as f:
             f.write(dst_contents)
+    elif write_back in (WriteBack.PATCH, WriteBack.COLOR_PATCH):
+        now = datetime.utcnow()
+        src_name = f"{src}\t{then} +0000"
+        dst_name = f"{src}\t{now} +0000"
+        if mode.is_ipynb:
+            raw_diff_contents = ipynb_patch_diff(
+                src_contents, dst_contents, src_name, dst_name
+            )
+        else:
+            raw_diff_contents = list(
+                gen_patch_diff(src_contents, dst_contents, src_name, dst_name)
+            )
+
+        if write_back == WriteBack.COLOR_PATCH:
+            diff_contents = [color_diff(content) for content in raw_diff_contents]
+        else:
+            diff_contents = raw_diff_contents
+
+        answers = list()
+        with lock or nullcontext():
+            f = io.TextIOWrapper(
+                sys.stdout.buffer,
+                encoding=encoding,
+                newline=newline,
+                write_through=True,
+            )
+            f = wrap_stream_for_windows(f)
+            total = len(diff_contents) - 1
+            for i, entry in enumerate(diff_contents):
+                action = None
+                f.write(entry)
+                if i == 0:
+                    continue
+                while action not in ["y", "n"]:
+                    if action == "?":
+                        f.write("\33[0;34my - accept this change\n")
+                        f.write("\33[0;34mn - reject this change\n")
+                        f.write("\33[0;34m? - print help\n")
+                    f.write(f"\033[95m({i}/{total}) Stage this hunk [y,n,?]? \033[0m")
+                    action = input()
+                answers.append(action)
+            f.detach()
+
+        if not any(a == "y" for a in answers):
+            return False
+
+        patched_dst_contents = merge_patches(
+            src_contents, dst_contents, raw_diff_contents, answers
+        )
+        with open(src, "w", encoding=encoding, newline=newline) as f:
+            f.write(patched_dst_contents)
+
     elif write_back in (WriteBack.DIFF, WriteBack.COLOR_DIFF):
         now = datetime.utcnow()
         src_name = f"{src}\t{then} +0000"

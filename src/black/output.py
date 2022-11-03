@@ -5,7 +5,7 @@ The double calls are for patching purposes in tests.
 
 import json
 import tempfile
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 from click import echo, style
 from mypy_extensions import mypyc_attr
@@ -55,25 +55,52 @@ def ipynb_diff(a: str, b: str, a_name: str, b_name: str) -> str:
     return "".join(diff_lines)
 
 
-def diff(a: str, b: str, a_name: str, b_name: str) -> str:
-    """Return a unified diff string between strings `a` and `b`."""
+def gen_patch_diff(a: str, b: str, a_name: str, b_name: str) -> str:
+    """Generator that yields patches of a unified diff between strings `a` and `b`."""
     import difflib
 
     a_lines = a.splitlines(keepends=True)
     b_lines = b.splitlines(keepends=True)
-    diff_lines = []
+    current_patch = ""
     for line in difflib.unified_diff(
         a_lines, b_lines, fromfile=a_name, tofile=b_name, n=5
     ):
+        if line.startswith("@@"):
+            yield current_patch
+            current_patch = ""
         # Work around https://bugs.python.org/issue2142
         # See:
         # https://www.gnu.org/software/diffutils/manual/html_node/Incomplete-Lines.html
         if line[-1] == "\n":
-            diff_lines.append(line)
+            current_patch += line
         else:
-            diff_lines.append(line + "\n")
-            diff_lines.append("\\ No newline at end of file\n")
-    return "".join(diff_lines)
+            current_patch += line + "\n"
+            current_patch += "\\ No newline at end of file\n"
+    yield current_patch
+
+
+def merge_patches(a: str, b: str, options: List[str], answers: List[str]):
+    a_lines = a.splitlines(keepends=True)
+    b_lines = b.splitlines(keepends=True)
+    result = list()
+    prev_to = 0
+    for answer, hunk in zip(answers, options[1:]):
+        header = hunk[: hunk.find("\n")].split(" ")
+        old_from, old_length = tuple(map(int, header[1][1:].split(",")))
+        new_from, new_length = tuple(map(int, header[2][1:].split(",")))
+        result.extend(a_lines[prev_to:old_from])
+        if answer == "n":  # old
+            result.extend(a_lines[old_from : old_from + old_length])
+        elif answer == "y":  # new
+            result.extend(b_lines[new_from : new_from + new_length])
+        prev_to = old_from + old_length
+    result.extend(a_lines[prev_to:])
+    return "".join(result)
+
+
+def diff(a: str, b: str, a_name: str, b_name: str) -> str:
+    # """Return a unified diff string between strings `a` and `b`."""
+    return "".join(gen_patch_diff(a, b, a_name, b_name))
 
 
 def color_diff(contents: str) -> str:
